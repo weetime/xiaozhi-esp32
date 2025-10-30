@@ -54,3 +54,8 @@ void Display::SetTheme(Theme* theme) {
 void Display::SetPowerSaveMode(bool on) {
     ESP_LOGW(TAG, "SetPowerSaveMode: %d", on);
 }
+
+void Display::SetMusicInfo(const char* song_name) {
+    ESP_LOGW(TAG, "SetMusicInfo: %s", song_name ? song_name : "(empty)");
+    // 基础实现只记录日志，具体显示由子类实现
+}
