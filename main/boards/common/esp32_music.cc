@@ -430,8 +430,9 @@ bool Esp32Music::Download(const std::string& song_name, const std::string& artis
                 std::string song_id = preview_url_str.substr(preview_url_str.find(":") + 1);
                 ESP_LOGI(TAG, "Extracted song ID from preview_url: %s", song_id.c_str());
                 
-                // 调用 /api/song-url/{id}?level=exhigh 获取实际音频流URL
-                std::string song_url_api = base_url + "/api/song-url/" + song_id + "?level=exhigh";
+                // 调用 /api/song-url/{id}?level=standard 获取实际音频流URL
+                // 使用standard音质以避免高音质导致的下载/播放问题
+                std::string song_url_api = base_url + "/api/song-url/" + song_id + "?level=standard";
                 ESP_LOGI(TAG, "Requesting audio stream URL from: %s", song_url_api.c_str());
                 
                 // 创建新的HTTP请求获取音频流URL
@@ -470,8 +471,17 @@ bool Esp32Music::Download(const std::string& song_name, const std::string& artis
                         if (cJSON_IsString(url_field) && url_field->valuestring && strlen(url_field->valuestring) > 0) {
                             audio_stream_url = url_field->valuestring;
                             ESP_LOGI(TAG, "Got audio stream URL: %s", audio_stream_url.c_str());
+                            
+                            // 验证URL格式
+                            if (audio_stream_url.find("http://") != 0 && audio_stream_url.find("https://") != 0) {
+                                ESP_LOGE(TAG, "Invalid audio stream URL format: %s", audio_stream_url.c_str());
+                                cJSON_Delete(song_url_json);
+                                cJSON_Delete(response_json);
+                                return false;
+                            }
                         } else {
-                            ESP_LOGE(TAG, "No 'url' field found in song-url API response");
+                            ESP_LOGE(TAG, "No 'url' field found in song-url API response or URL is empty");
+                            ESP_LOGE(TAG, "Response content: %s", song_url_response.c_str());
                             cJSON_Delete(song_url_json);
                             cJSON_Delete(response_json);
                             return false;
@@ -506,6 +516,8 @@ bool Esp32Music::Download(const std::string& song_name, const std::string& artis
                 cJSON_Delete(response_json);
                 return false;
             }
+            
+            ESP_LOGI(TAG, "Streaming started successfully, music should be playing now");
             
             // 处理歌词URL - 使用新API的歌词接口
             // track_id可能是数字或字符串，需要统一处理
@@ -579,8 +591,6 @@ bool Esp32Music::StartStreaming(const std::string& music_url) {
         return false;
     }
     
-    ESP_LOGD(TAG, "Starting streaming for URL: %s", music_url.c_str());
-    
     // 停止之前的播放和下载
     is_downloading_ = false;
     is_playing_ = false;
@@ -620,6 +630,9 @@ bool Esp32Music::StartStreaming(const std::string& music_url) {
     play_thread_ = std::thread(&Esp32Music::PlayAudioStream, this);
     
     ESP_LOGI(TAG, "Streaming threads started successfully");
+    
+    // 给线程一点时间启动
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     
     return true;
 }
@@ -714,11 +727,15 @@ bool Esp32Music::StopStreaming() {
 
 // 流式下载音频数据
 void Esp32Music::DownloadAudioStream(const std::string& music_url) {
-    ESP_LOGD(TAG, "Starting audio stream download from: %s", music_url.c_str());
-    
     // 验证URL有效性
-    if (music_url.empty() || music_url.find("http") != 0) {
-        ESP_LOGE(TAG, "Invalid URL format: %s", music_url.c_str());
+    if (music_url.empty()) {
+        ESP_LOGE(TAG, "Music URL is empty");
+        is_downloading_ = false;
+        return;
+    }
+    
+    if (music_url.find("http://") != 0 && music_url.find("https://") != 0) {
+        ESP_LOGE(TAG, "Invalid URL format (must start with http:// or https://): %s", music_url.c_str());
         is_downloading_ = false;
         return;
     }
@@ -735,20 +752,18 @@ void Esp32Music::DownloadAudioStream(const std::string& music_url) {
     // add_auth_headers(http.get());
     
     if (!http->Open("GET", music_url)) {
-        ESP_LOGE(TAG, "Failed to connect to music stream URL");
+        ESP_LOGE(TAG, "Failed to connect to music stream URL: %s", music_url.c_str());
         is_downloading_ = false;
         return;
     }
     
     int status_code = http->GetStatusCode();
     if (status_code != 200 && status_code != 206) {  // 206 for partial content
-        ESP_LOGE(TAG, "HTTP GET failed with status code: %d", status_code);
+        ESP_LOGE(TAG, "HTTP GET failed with status code: %d for URL: %s", status_code, music_url.c_str());
         http->Close();
         is_downloading_ = false;
         return;
     }
-    
-    ESP_LOGI(TAG, "Started downloading audio stream, status: %d", status_code);
     
     // 分块读取音频数据
     const size_t chunk_size = 4096;  // 4KB每块
@@ -852,10 +867,16 @@ void Esp32Music::PlayAudioStream() {
     total_frames_decoded_ = 0;
     
     auto codec = Board::GetInstance().GetAudioCodec();
-    if (!codec || !codec->output_enabled()) {
-        ESP_LOGE(TAG, "Audio codec not available or not enabled");
+    if (!codec) {
+        ESP_LOGE(TAG, "Audio codec not available");
         is_playing_ = false;
         return;
+    }
+    
+    // 确保音频输出已启用（可能在状态切换时被关闭）
+    if (!codec->output_enabled()) {
+        ESP_LOGW(TAG, "Audio output not enabled at start, enabling it");
+        codec->EnableOutput(true);
     }
     
     if (!mp3_decoder_initialized_) {
@@ -914,6 +935,13 @@ void Esp32Music::PlayAudioStream() {
             // 如果不是空闲状态，暂停播放
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
+        }
+        
+        // 设备状态检查通过，确保音频输出已启用
+        // 状态切换可能会关闭音频输出，需要重新启用
+        if (codec && !codec->output_enabled()) {
+            ESP_LOGW(TAG, "Audio output was disabled, re-enabling it");
+            codec->EnableOutput(true);
         }
         
         // 设备状态检查通过，显示当前播放的歌名
@@ -1117,13 +1145,29 @@ void Esp32Music::PlayAudioStream() {
             
         } else {
             // 解码失败
-            ESP_LOGW(TAG, "MP3 decode failed with error: %d", decode_result);
+            ESP_LOGW(TAG, "MP3 decode failed with error: %d, bytes_left=%d", decode_result, bytes_left);
             
-            // 跳过一些字节继续尝试
-            if (bytes_left > 1) {
-                read_ptr++;
-                bytes_left--;
+            // 尝试重新查找MP3帧同步，而不是只跳过1个字节
+            if (bytes_left > 4) {
+                // 跳过当前可能无效的位置，重新查找同步字
+                int sync_offset = MP3FindSyncWord(read_ptr + 1, bytes_left - 1);
+                if (sync_offset >= 0) {
+                    // 找到了新的同步位置
+                    read_ptr += 1 + sync_offset;
+                    bytes_left -= (1 + sync_offset);
+                    ESP_LOGD(TAG, "Found new sync word after decode failure, offset=%d", 1 + sync_offset);
+                } else {
+                    // 没找到同步字，跳过一些字节继续尝试
+                    if (bytes_left > 10) {
+                        read_ptr += 10;
+                        bytes_left -= 10;
+                        ESP_LOGD(TAG, "No sync word found, skipping 10 bytes");
+                    } else {
+                        bytes_left = 0;
+                    }
+                }
             } else {
+                // 数据不足，等待更多数据
                 bytes_left = 0;
             }
         }
@@ -1303,9 +1347,13 @@ bool Esp32Music::DownloadLyrics(const std::string& lyric_url) {
             continue;
         }
         
-        // 非200系列状态码视为错误
+        // 非200系列状态码视为错误（但404等可能是正常的，表示没有歌词）
         if (status_code < 200 || status_code >= 300) {
-            ESP_LOGE(TAG, "HTTP GET failed with status code: %d", status_code);
+            if (status_code == 404) {
+                ESP_LOGW(TAG, "Lyric not found (404) - song may not have lyrics, this is normal");
+            } else {
+                ESP_LOGW(TAG, "HTTP GET failed with status code: %d (song may not have lyrics)", status_code);
+            }
             http->Close();
             retry_count++;
             continue;
@@ -1387,7 +1435,7 @@ bool Esp32Music::DownloadLyrics(const std::string& lyric_url) {
         // 检查success字段
         cJSON* success = cJSON_GetObjectItem(lyric_json, "success");
         if (!cJSON_IsTrue(success)) {
-            ESP_LOGE(TAG, "Lyric API returned success=false");
+            ESP_LOGW(TAG, "Lyric API returned success=false (song may not have lyrics)");
             cJSON_Delete(lyric_json);
             return false;
         }
@@ -1396,18 +1444,18 @@ bool Esp32Music::DownloadLyrics(const std::string& lyric_url) {
         cJSON* lyric_obj = cJSON_GetObjectItem(lyric_json, "lyric");
         if (lyric_obj) {
             cJSON* lyric_text = cJSON_GetObjectItem(lyric_obj, "lyric");
-            if (cJSON_IsString(lyric_text) && lyric_text->valuestring) {
+            if (cJSON_IsString(lyric_text) && lyric_text->valuestring && strlen(lyric_text->valuestring) > 0) {
                 std::string lrc_content = lyric_text->valuestring;
                 ESP_LOGI(TAG, "Extracted LRC content, size: %d bytes", lrc_content.length());
                 cJSON_Delete(lyric_json);
                 return ParseLyrics(lrc_content);
             } else {
-                ESP_LOGE(TAG, "No 'lyric' text field found in response");
+                ESP_LOGW(TAG, "No 'lyric' text field found or lyric is empty (song may not have lyrics)");
                 cJSON_Delete(lyric_json);
                 return false;
             }
         } else {
-            ESP_LOGE(TAG, "No 'lyric' object found in response");
+            ESP_LOGW(TAG, "No 'lyric' object found in response (song may not have lyrics)");
             cJSON_Delete(lyric_json);
             return false;
         }
@@ -1515,11 +1563,15 @@ bool Esp32Music::ParseLyrics(const std::string& lyric_content) {
 void Esp32Music::LyricDisplayThread() {
     ESP_LOGI(TAG, "Lyric display thread started");
     
+    // 尝试下载歌词，失败不影响播放
     if (!DownloadLyrics(current_lyric_url_)) {
-        ESP_LOGE(TAG, "Failed to download or parse lyrics");
+        ESP_LOGW(TAG, "Failed to download or parse lyrics (this will not affect music playback)");
+        // 歌词下载失败不影响播放，只是记录警告
         is_lyric_running_ = false;
         return;
     }
+    
+    ESP_LOGI(TAG, "Lyrics loaded successfully, ready to display");
     
     // 定期检查是否需要更新显示(频率可以降低)
     while (is_lyric_running_ && is_playing_) {
